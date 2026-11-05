@@ -12,6 +12,8 @@ Instructions:
 import os
 import time
 from typing import Any, Callable
+from dotenv import load_dotenv
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Estimated costs per 1M INPUT & OUTPUT tokens (USD) as of March 2026
@@ -21,6 +23,7 @@ PRICING_1M_TOKENS = {
     "gpt-4o": {"input": 5.00, "output": 20.00},
     "gpt-4o-mini": {"input": 0.150, "output": 0.600},
     "gemini-2.5-flash": {"input": 0.075, "output": 0.300},
+    "gemini-3.8-flash": {"input": 0.075, "output": 0.300},  # TODO: cập nhật giá thật từ Google
     "gemini-2.5-pro": {"input": 1.25, "output": 5.00},
     "claude-3-5-sonnet": {"input": 3.00, "output": 15.00},
     "claude-3-5-haiku": {"input": 0.80, "output": 4.00},
@@ -29,7 +32,7 @@ PRICING_1M_TOKENS = {
 # Standard Model Identifiers
 OPENAI_MODEL = "gpt-4o"
 OPENAI_MINI_MODEL = "gpt-4o-mini"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 ANTHROPIC_MODEL = "claude-3-5-haiku"
 
 
@@ -65,9 +68,27 @@ def call_openai(
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         # response.usage contains input_tokens and output_tokens (prompt_tokens/completion_tokens)
     """
-    # TODO: Import OpenAI, instantiate client, call chat.completions.create with parameters,
-    #       measure execution start/end time, extract text and token usage, and return them.
-    raise NotImplementedError("Implement call_openai")
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    start = time.time()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+    )
+    latency = time.time() - start
+
+    text = response.choices[0].message.content
+    usage = {
+        "input_tokens": response.usage.prompt_tokens,
+        "output_tokens": response.usage.completion_tokens,
+    }
+
+    return text, latency, usage
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +107,7 @@ def call_gemini(
 
     Args:
         prompt:      The user message to send.
-        model:       The Gemini model to use (default: gemini-2.5-flash).
+        model:       The Gemini model to use (default: gemini-3.8-flash).
         temperature: Sampling temperature.
         top_p:       Nucleus sampling threshold.
         max_tokens:  Maximum number of tokens to generate.
@@ -113,10 +134,50 @@ def call_gemini(
         Ensure your usage dictionary extracts 'input_tokens' and 'output_tokens' 
         from the response metadata (e.g. response.usage_metadata).
     """
-    # TODO: Initialize Gemini client, set config parameters, call generate_content,
-    #       measure latency, extract response text and usage metadata, and return the tuple.
-    raise NotImplementedError("Implement call_gemini")
+   
+    from google import genai
+    from google.genai import types
 
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+    if model.startswith("gemini-2"):
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_tokens,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        )
+    else:  # Gemini 3.x trở lên: không hỗ trợ temperature/top_p
+        config = types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+        )
+
+    from google.genai import errors as genai_errors
+
+    start = time.time()
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+            break
+        except genai_errors.ServerError:  # 5xx: quá tải / tạm thời
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+    latency = time.time() - start
+
+    text = response.text or ""
+    usage = {
+        "input_tokens": response.usage_metadata.prompt_token_count or 0,
+        "output_tokens": response.usage_metadata.candidates_token_count or 0,
+    }
+
+    return text, latency, usage
 
 # ---------------------------------------------------------------------------
 # Task 3 — Call Anthropic Claude (Exploratory track)
@@ -200,8 +261,58 @@ def streaming_chatbot() -> None:
         - Check how to stream responses using client.chats or model.generate_content(..., stream=True).
         - Keep history limited to the last 3 turns to optimize context window and costs.
     """
-    # TODO: Setup interactive session, prompt user for input, stream response, and update history.
-    raise NotImplementedError("Implement streaming_chatbot")
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    history = []  # list[types.Content]
+
+    print("Chatbot (gõ 'quit' hoặc 'exit' để thoát)")
+    while True:
+        user_input = input("\nBạn: ").strip()
+        if user_input.lower() in ("quit", "exit"):
+            print("Tạm biệt!")
+            break
+        if not user_input:
+            continue
+
+        history.append(types.Content(role="user", parts=[types.Part(text=user_input)]))
+        history = history[-6:]  # giữ 3 lượt gần nhất (6 tin nhắn)
+
+        print("Bot: ", end="", flush=True)
+        reply = ""
+        config = types.GenerateContentConfig(
+            max_output_tokens=4096,
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+        )
+        error = None
+        for attempt in range(4):
+            try:
+                for chunk in client.models.generate_content_stream(
+                    model=GEMINI_MODEL,
+                    contents=history,
+                    config=config,
+                ):
+                    if chunk.text:
+                        print(chunk.text, end="", flush=True)
+                        reply += chunk.text
+                error = None
+                break
+            except Exception as e:
+                error = e
+                # Chỉ retry khi lỗi 5xx và chưa in chữ nào (tránh in lặp)
+                if getattr(e, "code", None) in (500, 502, 503, 504) and not reply and attempt < 3:
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+        if error is not None:
+            print(f"\n[Lỗi: {error}]")
+            history.pop()  # bỏ tin user vừa thêm vì không có câu trả lời
+            continue
+        print()
+
+        history.append(types.Content(role="model", parts=[types.Part(text=reply)]))
+        history = history[-6:]
 
 
 # ---------------------------------------------------------------------------
